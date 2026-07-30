@@ -1,0 +1,1148 @@
+"""
+PASS 1 — ZERO-SHOT TSFM BENCHMARKING
+======================================
+Feasibility study: do TSFMs outperform SARIMA on specialty
+materials demand data out of the box?
+
+Install:
+    pip install pandas numpy scipy matplotlib statsmodels
+    pip install chronos-forecasting
+    pip install timesfm
+
+Usage:
+    Set FULFILLED_PATH and UNFULFILLED_PATH below
+    Run: python pass1_benchmarking.py
+
+Outputs saved to: pass1_results/
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import warnings
+import os
+import json
+import torch
+from scipy.stats import mannwhitneyu
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.stattools import adfuller
+
+warnings.filterwarnings("ignore")
+np.random.seed(42)
+
+# ══════════════════════════════════════════════════════════════
+# CONFIGURATION — EDIT THESE
+# ══════════════════════════════════════════════════════════════
+
+FULFILLED_PATH   = "fulfilled_demand.csv"
+UNFULFILLED_PATH = "unfulfilled_demand.csv"
+OUTPUT_DIR       = "pass1_results"
+
+# Fixed parameters — do not change between runs
+AGG_LEVEL         = "monthly"
+HORIZON           = 3       # months ahead to forecast
+MIN_TRAIN         = 24      # minimum months of training history
+N_WINDOWS         = 6       # rolling origin windows per SKU
+ADI_THRESHOLD     = 1.32    # Syntetos-Boylan ADI boundary
+CV2_THRESHOLD     = 0.49    # Syntetos-Boylan CV² boundary
+SPIKE_THRESHOLD   = 2.0     # MASE above this = spike window
+
+# Clear outperformance thresholds
+THRESHOLD_OVERALL = 0.10    # 10% MASE improvement = clear win overall
+THRESHOLD_ERRATIC = 0.20    # 20% MASE improvement = clear win on erratic
+
+# Chronos configuration
+CHRONOS_MODEL  = "amazon/chronos-t5-small"
+CHRONOS_NSAMPLES = 20
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# TimesFM configuration
+TIMESFM_MODEL = "google/timesfm-1.0-200m"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(f"{OUTPUT_DIR}/plots", exist_ok=True)
+
+COLORS = {
+    "smooth":       "#2ecc71",
+    "erratic":      "#e74c3c",
+    "intermittent": "#3498db",
+    "lumpy":        "#f39c12",
+}
+
+print("=" * 65)
+print("PASS 1 — ZERO-SHOT TSFM BENCHMARKING")
+print("=" * 65)
+print(f"Aggregation:  {AGG_LEVEL}")
+print(f"Horizon:      {HORIZON} months")
+print(f"Min training: {MIN_TRAIN} months")
+print(f"Windows:      {N_WINDOWS} rolling origin")
+print(f"Device:       {DEVICE}")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 1 — DATA LOADING AND MONTHLY AGGREGATION
+# ══════════════════════════════════════════════════════════════
+
+print("\n" + "=" * 65)
+print("STEP 1 — Data Loading and Monthly Aggregation")
+print("=" * 65)
+
+
+def load_and_aggregate(ful_path, unf_path):
+    """
+    Load daily fulfilled and unfulfilled demand.
+    Aggregate to calendar monthly totals per SKU.
+    Returns monthly DataFrame with columns:
+        year_month, sku_id, fulfilled, unfulfilled, total
+    """
+    ful = pd.read_csv(ful_path, parse_dates=True)
+    unf = pd.read_csv(unf_path, parse_dates=True)
+
+    for df in [ful, unf]:
+        df.columns = df.columns.str.lower().str.strip()
+        for col in list(df.columns):
+            if "date" in col:
+                df.rename(columns={col: "date"}, inplace=True)
+                df["date"] = pd.to_datetime(df["date"])
+            if any(x in col for x in
+                   ["material", "sku", "item", "product", "part"]):
+                df.rename(columns={col: "sku_id"}, inplace=True)
+            if any(x in col for x in
+                   ["qty", "quantity", "demand", "amount", "volume"]):
+                df.rename(columns={col: "quantity"}, inplace=True)
+
+    # Aggregate daily to monthly
+    ful["year_month"] = ful["date"].dt.to_period("M")
+    unf["year_month"] = unf["date"].dt.to_period("M")
+
+    ful_m = ful.groupby(["year_month", "sku_id"])["quantity"] \
+               .sum().reset_index() \
+               .rename(columns={"quantity": "fulfilled"})
+    unf_m = unf.groupby(["year_month", "sku_id"])["quantity"] \
+               .sum().reset_index() \
+               .rename(columns={"quantity": "unfulfilled"})
+
+    monthly = pd.merge(ful_m, unf_m,
+                       on=["year_month", "sku_id"],
+                       how="outer").fillna(0)
+    monthly["total"] = monthly["fulfilled"] + monthly["unfulfilled"]
+
+    # Sort by SKU and time
+    monthly = monthly.sort_values(
+        ["sku_id", "year_month"]
+    ).reset_index(drop=True)
+
+    return monthly
+
+
+monthly = load_and_aggregate(FULFILLED_PATH, UNFULFILLED_PATH)
+skus    = sorted(monthly["sku_id"].unique())
+n_skus  = len(skus)
+
+print(f"\n  SKUs: {n_skus}")
+print(f"  Date range: {monthly['year_month'].min()} "
+      f"to {monthly['year_month'].max()}")
+print(f"  Total monthly rows: {len(monthly):,}")
+
+# Build per-SKU arrays
+# Use TOTAL demand as model input signal
+# Reason: total = fulfilled + unfulfilled = best available
+# approximation of true demand the company experienced
+series = {}
+for sku in skus:
+    sub = monthly[monthly["sku_id"] == sku] \
+              .sort_values("year_month")
+    series[sku] = {
+        "total":       sub["total"].values.astype(float),
+        "fulfilled":   sub["fulfilled"].values.astype(float),
+        "unfulfilled": sub["unfulfilled"].values.astype(float),
+        "periods":     sub["year_month"].values,
+    }
+
+# ══════════════════════════════════════════════════════════════
+# STEP 2 — DEMAND CHARACTERISATION
+# ══════════════════════════════════════════════════════════════
+
+print("\n" + "=" * 65)
+print("STEP 2 — Demand Characterisation (Monthly Fulfilled Signal)")
+print("=" * 65)
+
+
+def classify_sku(arr):
+    """
+    Compute ADI and CV² on fulfilled monthly demand.
+    Returns adi, cv2, demand_class.
+
+    Uses FULFILLED signal for classification because:
+    - This reflects what the planning system observes
+    - Classification should match real operational data
+    - Avoids inflating demand class difficulty artificially
+    """
+    nz = arr[arr > 0]
+    n  = len(arr)
+    if len(nz) < 2:
+        return np.nan, np.nan, "unknown"
+    adi = n / len(nz)
+    cv2 = (nz.std(ddof=1) / nz.mean()) ** 2
+    if adi < ADI_THRESHOLD and cv2 < CV2_THRESHOLD:
+        cls = "smooth"
+    elif adi < ADI_THRESHOLD:
+        cls = "erratic"
+    elif cv2 < CV2_THRESHOLD:
+        cls = "intermittent"
+    else:
+        cls = "lumpy"
+    return round(adi, 4), round(cv2, 4), cls
+
+
+sku_meta = []
+for sku in skus:
+    ful_arr  = series[sku]["fulfilled"]
+    unf_arr  = series[sku]["unfulfilled"]
+    tot_arr  = series[sku]["total"]
+    T        = len(tot_arr)
+
+    adi, cv2, cls = classify_sku(ful_arr)
+    cens_ratio    = (unf_arr.sum() / ful_arr.sum()
+                     if ful_arr.sum() > 0 else 0.0)
+
+    # Check if SKU has enough data for evaluation
+    feasible = T >= MIN_TRAIN + HORIZON
+
+    sku_meta.append({
+        "sku_id":          sku,
+        "n_months":        T,
+        "demand_class":    cls,
+        "adi":             adi,
+        "cv2":             cv2,
+        "mean_monthly":    round(ful_arr.mean(), 2),
+        "censoring_ratio": round(cens_ratio, 4),
+        "feasible":        feasible,
+    })
+
+df_meta = pd.DataFrame(sku_meta)
+
+print(f"\n  Demand class distribution (monthly fulfilled signal):")
+for cls, cnt in df_meta["demand_class"].value_counts().items():
+    bar = "█" * cnt
+    print(f"    {cls:15s}: {cnt:3d} SKUs  {bar}")
+
+print(f"\n  Feasible SKUs (≥{MIN_TRAIN}+{HORIZON} months): "
+      f"{df_meta['feasible'].sum()} of {n_skus}")
+print(f"\n  Censoring ratio summary:")
+cr = df_meta["censoring_ratio"]
+print(f"    Min={cr.min():.3f}  "
+      f"Median={cr.median():.3f}  "
+      f"Max={cr.max():.3f}")
+
+feasible_skus = df_meta[df_meta["feasible"]]["sku_id"].tolist()
+print(f"\n  Proceeding with {len(feasible_skus)} feasible SKUs")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 3 — ROLLING ORIGIN WINDOWS
+# ══════════════════════════════════════════════════════════════
+
+print("\n" + "=" * 65)
+print("STEP 3 — Rolling Origin Window Definition")
+print("=" * 65)
+
+
+def get_windows(T, n_windows, horizon, min_train):
+    """
+    Generate rolling origin window indices.
+
+    Each window = (train_end, test_start, test_end)
+    where:
+      train = series[0 : train_end]
+      test  = series[test_start : test_end]
+      train_end == test_start (no gap)
+
+    Windows are evenly spaced across valid range.
+    Non-overlapping test periods guaranteed.
+    """
+    min_origin = min_train           # earliest valid train_end
+    max_origin = T - horizon         # latest valid train_end
+
+    if max_origin < min_origin:
+        return []
+
+    # Evenly spaced origins
+    origins = np.linspace(min_origin, max_origin,
+                          n_windows, dtype=int)
+
+    # Enforce non-overlapping test windows
+    clean = [int(origins[0])]
+    for o in origins[1:]:
+        o = int(o)
+        if o >= clean[-1] + horizon:
+            clean.append(o)
+
+    windows = []
+    for origin in clean:
+        test_end = origin + horizon
+        if test_end <= T:
+            windows.append((origin, origin, test_end))
+
+    return windows
+
+
+# Print window structure for first feasible SKU as example
+example_sku = feasible_skus[0]
+example_T   = series[example_sku]["total"].shape[0]
+example_w   = get_windows(example_T, N_WINDOWS,
+                           HORIZON, MIN_TRAIN)
+print(f"\n  Example window structure for {example_sku} "
+      f"(T={example_T} months):")
+print(f"  {'Window':<8} {'Train months':<15} "
+      f"{'Test months':<15} {'Train size'}")
+for i, (te, ts, tend) in enumerate(example_w):
+    print(f"  {i+1:<8} {0}:{te:<13} {ts}:{tend:<13} "
+          f"{te} months")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 4 — EVALUATION METRICS
+# ══════════════════════════════════════════════════════════════
+
+def mase(actual, forecast, baseline_forecast):
+    """
+    MASE scaled against yearly average baseline.
+
+    MASE = MAE(model) / MAE(baseline)
+
+    Value < 1.0 means model beats the baseline.
+    Value = 1.0 means model matches the baseline.
+    Value > 1.0 means model is worse than the baseline.
+
+    Scaled against yearly average (not naive seasonal)
+    because yearly average is the company's actual baseline.
+    This directly answers the industrial question.
+    """
+    actual   = np.array(actual,            dtype=float)
+    forecast = np.array(forecast,          dtype=float)
+    baseline = np.array(baseline_forecast, dtype=float)
+
+    mae_model    = np.mean(np.abs(actual - forecast))
+    mae_baseline = np.mean(np.abs(actual - baseline))
+
+    if mae_baseline == 0:
+        return np.nan
+
+    return mae_model / mae_baseline
+
+
+def smape(actual, forecast):
+    """Symmetric MAPE — stable near zero."""
+    a    = np.array(actual,   dtype=float)
+    f    = np.array(forecast, dtype=float)
+    dnom = (np.abs(a) + np.abs(f)) / 2
+    mask = dnom > 0
+    if mask.sum() == 0:
+        return np.nan
+    return np.mean(np.abs(a[mask] - f[mask]) / dnom[mask]) * 100
+
+
+def mae_metric(actual, forecast):
+    return np.mean(np.abs(
+        np.array(actual, dtype=float) -
+        np.array(forecast, dtype=float)
+    ))
+
+
+def coverage(actual, lower, upper):
+    """Fraction of actuals inside prediction interval."""
+    a = np.array(actual, dtype=float)
+    l = np.array(lower,  dtype=float)
+    u = np.array(upper,  dtype=float)
+    return np.mean((a >= l) & (a <= u))
+
+
+def simulated_unfulfilled_reduction(actual_unf,
+                                    actual_ful,
+                                    forecast,
+                                    baseline_forecast):
+    """
+    Simulate unfulfilled order reduction.
+
+    Logic:
+    - If company had ordered forecast units in advance,
+      and actual demand = actual_ful + actual_unf,
+      then unfulfilled = max(0, total_demand - forecast)
+    - Compare unfulfilled under model forecast vs
+      unfulfilled under baseline forecast
+
+    Returns: (unfulfilled_model, unfulfilled_baseline,
+              reduction_pct)
+
+    Positive reduction = model reduces unfulfilled orders.
+    Negative reduction = model makes it worse.
+    """
+    total_demand = np.array(actual_ful,  dtype=float) \
+                 + np.array(actual_unf,  dtype=float)
+    f  = np.array(forecast,          dtype=float)
+    b  = np.array(baseline_forecast, dtype=float)
+
+    unf_model    = np.sum(np.maximum(0, total_demand - f))
+    unf_baseline = np.sum(np.maximum(0, total_demand - b))
+
+    if unf_baseline == 0:
+        return unf_model, unf_baseline, np.nan
+
+    reduction_pct = (unf_baseline - unf_model) / unf_baseline * 100
+
+    return unf_model, unf_baseline, round(reduction_pct, 2)
+
+
+# ══════════════════════════════════════════════════════════════
+# STEP 5 — BASELINE FORECASTS
+# ══════════════════════════════════════════════════════════════
+
+print("\n" + "=" * 65)
+print("STEP 5 — Baseline Forecasts (Yearly Average + SARIMA)")
+print("=" * 65)
+
+
+def forecast_yearly_average(train, horizon):
+    """
+    Yearly average baseline — what the company was doing.
+    Takes mean of last 12 months and applies flat for horizon.
+    """
+    last_12 = train[-12:] if len(train) >= 12 else train
+    avg     = np.mean(last_12)
+    return np.full(horizon, avg)
+
+
+def forecast_sarima(train, horizon):
+    """
+    SARIMA with automatic order selection via AIC.
+    Seasonal period = 12 (monthly data).
+    """
+    arr = np.clip(np.array(train, dtype=float), 0, None)
+
+    # Stationarity check
+    try:
+        d = 0 if adfuller(arr, autolag="AIC")[1] < 0.05 else 1
+    except Exception:
+        d = 1
+
+    # Candidate orders — seasonal period 12
+    configs = [
+        ((1, d, 1), (1, 1, 0, 12)),
+        ((1, d, 0), (1, 0, 0, 12)),
+        ((0, d, 1), (0, 1, 0, 12)),
+        ((1, d, 1), (0, 0, 0,  0)),
+        ((0, d, 1), (0, 0, 0,  0)),
+        ((1, d, 0), (0, 0, 0,  0)),
+    ]
+
+    best_aic  = np.inf
+    best_pred = None
+
+    for order, seas_order in configs:
+        try:
+            fit = SARIMAX(
+                arr,
+                order=order,
+                seasonal_order=seas_order,
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+            ).fit(disp=False, maxiter=100)
+
+            if fit.aic < best_aic:
+                pred = np.clip(fit.forecast(horizon), 0, None)
+                if not (np.any(np.isnan(pred)) or
+                        np.any(np.isinf(pred))):
+                    best_aic  = fit.aic
+                    best_pred = pred
+        except Exception:
+            continue
+
+    # Fallback to yearly average if all configs fail
+    if best_pred is None:
+        return forecast_yearly_average(train, horizon)
+
+    return best_pred
+
+
+# ══════════════════════════════════════════════════════════════
+# STEP 6 — LOAD TSFM MODELS
+# ══════════════════════════════════════════════════════════════
+
+print("\n" + "=" * 65)
+print("STEP 6 — Loading TSFM Models")
+print("=" * 65)
+
+# Load Chronos 2
+try:
+    from chronos import ChronosPipeline
+    chronos_pipe = ChronosPipeline.from_pretrained(
+        CHRONOS_MODEL,
+        device_map=DEVICE,
+        torch_dtype=torch.bfloat16,
+    )
+    CHRONOS_OK = True
+    print(f"  Chronos 2 loaded: {CHRONOS_MODEL} on {DEVICE}")
+except Exception as e:
+    CHRONOS_OK = False
+    print(f"  Chronos 2 not available: {e}")
+
+# Load TimesFM
+try:
+    import timesfm
+    tfm = timesfm.TimesFm(
+        hparams=timesfm.TimesFmHparams(
+            backend="gpu" if DEVICE == "cuda" else "cpu",
+            per_core_batch_size=4,
+            horizon_len=HORIZON,
+        ),
+        checkpoint=timesfm.TimesFmCheckpoint(
+            huggingface_repo_id=TIMESFM_MODEL
+        ),
+    )
+    TIMESFM_OK = True
+    print(f"  TimesFM loaded: {TIMESFM_MODEL}")
+except Exception as e:
+    TIMESFM_OK = False
+    print(f"  TimesFM not available: {e}")
+
+
+def forecast_chronos(train, horizon):
+    """
+    Chronos 2 zero-shot forecast.
+    Returns median, 10th percentile, 90th percentile.
+    """
+    if not CHRONOS_OK:
+        return None, None, None
+    try:
+        ctx = torch.tensor(
+            train, dtype=torch.float32
+        ).unsqueeze(0)
+        with torch.no_grad():
+            samples = chronos_pipe.predict(
+                ctx,
+                prediction_length=horizon,
+                num_samples=CHRONOS_NSAMPLES,
+            )
+        # samples: (1, n_samples, horizon)
+        s      = samples[0].float().numpy()
+        median = np.clip(np.median(s, axis=0), 0, None)
+        lower  = np.clip(np.percentile(s, 10, axis=0), 0, None)
+        upper  = np.clip(np.percentile(s, 90, axis=0), 0, None)
+        return median, lower, upper
+    except Exception as e:
+        print(f"    Chronos error: {e}")
+        return None, None, None
+
+
+def forecast_timesfm(train, horizon):
+    """TimesFM zero-shot forecast. Returns point prediction."""
+    if not TIMESFM_OK:
+        return None
+    try:
+        inp   = [train.tolist()]
+        freq  = [0]   # 0 = default frequency
+        pred, _ = tfm.forecast(inp, freq=freq)
+        return np.clip(np.array(pred[0])[:horizon], 0, None)
+    except Exception as e:
+        print(f"    TimesFM error: {e}")
+        return None
+
+
+# ══════════════════════════════════════════════════════════════
+# STEP 7 — MAIN EVALUATION LOOP
+# ══════════════════════════════════════════════════════════════
+
+print("\n" + "=" * 65)
+print("STEP 7 — Main Evaluation Loop")
+print("=" * 65)
+
+all_results = []
+
+for i, sku in enumerate(feasible_skus):
+    tot_arr = series[sku]["total"]
+    ful_arr = series[sku]["fulfilled"]
+    unf_arr = series[sku]["unfulfilled"]
+    cls     = df_meta.loc[df_meta["sku_id"] == sku,
+                           "demand_class"].values[0]
+    cr      = df_meta.loc[df_meta["sku_id"] == sku,
+                           "censoring_ratio"].values[0]
+    T       = len(tot_arr)
+
+    windows = get_windows(T, N_WINDOWS, HORIZON, MIN_TRAIN)
+
+    for w_idx, (train_end, test_start, test_end) in \
+            enumerate(windows):
+
+        train_arr = tot_arr[:train_end]
+        test_arr  = tot_arr[test_start:test_end]
+        unf_test  = unf_arr[test_start:test_end]
+        ful_test  = ful_arr[test_start:test_end]
+
+        # Check if this window has stockout activity
+        # in the last 3 months of training lookback
+        recent_unf = unf_arr[
+            max(0, train_end - 3):train_end
+        ]
+        is_censored = bool(recent_unf.sum() > 0)
+
+        row = {
+            "sku_id":          sku,
+            "demand_class":    cls,
+            "censoring_ratio": cr,
+            "window_idx":      w_idx,
+            "train_months":    train_end,
+            "test_start":      test_start,
+            "test_end":        test_end,
+            "is_censored":     is_censored,
+            "actual_mean":     round(test_arr.mean(), 2),
+        }
+
+        # ── Yearly Average ───────────────────────────────────
+        ya_pred = forecast_yearly_average(train_arr, HORIZON)
+
+        row["ya_pred"]  = ya_pred.tolist()
+        row["ya_smape"] = smape(test_arr, ya_pred)
+        row["ya_mae"]   = mae_metric(test_arr, ya_pred)
+        # MASE for YA vs itself = 1.0 by definition
+        row["ya_mase"]  = 1.0
+
+        # ── SARIMA ───────────────────────────────────────────
+        sarima_pred = forecast_sarima(train_arr, HORIZON)
+
+        row["sarima_pred"]  = sarima_pred.tolist()
+        row["sarima_smape"] = smape(test_arr, sarima_pred)
+        row["sarima_mae"]   = mae_metric(test_arr, sarima_pred)
+        row["sarima_mase"]  = mase(test_arr, sarima_pred, ya_pred)
+
+        # Simulated unfulfilled reduction vs yearly average
+        unf_s, unf_ya, red_s = simulated_unfulfilled_reduction(
+            unf_test, ful_test, sarima_pred, ya_pred
+        )
+        row["sarima_unf_reduction_pct"] = red_s
+
+        # ── Chronos 2 ────────────────────────────────────────
+        c_med, c_lo, c_hi = forecast_chronos(train_arr, HORIZON)
+
+        if c_med is not None:
+            row["chronos_pred"]     = c_med.tolist()
+            row["chronos_smape"]    = smape(test_arr, c_med)
+            row["chronos_mae"]      = mae_metric(test_arr, c_med)
+            row["chronos_mase"]     = mase(test_arr, c_med, ya_pred)
+            row["chronos_coverage"] = coverage(test_arr, c_lo, c_hi)
+            _, _, red_c = simulated_unfulfilled_reduction(
+                unf_test, ful_test, c_med, ya_pred
+            )
+            row["chronos_unf_reduction_pct"] = red_c
+        else:
+            row["chronos_pred"]              = None
+            row["chronos_smape"]             = np.nan
+            row["chronos_mae"]               = np.nan
+            row["chronos_mase"]              = np.nan
+            row["chronos_coverage"]          = np.nan
+            row["chronos_unf_reduction_pct"] = np.nan
+
+        # ── TimesFM ──────────────────────────────────────────
+        t_pred = forecast_timesfm(train_arr, HORIZON)
+
+        if t_pred is not None:
+            row["timesfm_pred"]  = t_pred.tolist()
+            row["timesfm_smape"] = smape(test_arr, t_pred)
+            row["timesfm_mae"]   = mae_metric(test_arr, t_pred)
+            row["timesfm_mase"]  = mase(test_arr, t_pred, ya_pred)
+            _, _, red_t = simulated_unfulfilled_reduction(
+                unf_test, ful_test, t_pred, ya_pred
+            )
+            row["timesfm_unf_reduction_pct"] = red_t
+        else:
+            row["timesfm_pred"]              = None
+            row["timesfm_smape"]             = np.nan
+            row["timesfm_mae"]               = np.nan
+            row["timesfm_mase"]              = np.nan
+            row["timesfm_unf_reduction_pct"] = np.nan
+
+        all_results.append(row)
+
+    print(f"  [{i+1:2d}/{len(feasible_skus)}] {sku:35s} | "
+          f"{cls:12s} | CR={cr:.2f} | "
+          f"windows={len(windows)}")
+
+df_results = pd.DataFrame(all_results)
+print(f"\n  Total windows evaluated: {len(df_results)}")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 8 — PER-SKU SUMMARY
+# ══════════════════════════════════════════════════════════════
+
+print("\n" + "=" * 65)
+print("STEP 8 — Per-SKU Summary")
+print("=" * 65)
+
+sku_summary = []
+for sku in feasible_skus:
+    w   = df_results[df_results["sku_id"] == sku]
+    cls = df_meta.loc[df_meta["sku_id"] == sku,
+                      "demand_class"].values[0]
+    cr  = df_meta.loc[df_meta["sku_id"] == sku,
+                      "censoring_ratio"].values[0]
+    rec = {
+        "sku_id":          sku,
+        "demand_class":    cls,
+        "censoring_ratio": cr,
+        "n_windows":       len(w),
+    }
+
+    for model in ["ya", "sarima", "chronos", "timesfm"]:
+        mase_col  = f"{model}_mase"
+        smape_col = f"{model}_smape"
+        red_col   = f"{model}_unf_reduction_pct"
+
+        if mase_col in w.columns:
+            vals = w[mase_col].dropna()
+            rec[f"{model}_mase_median"] = round(vals.median(), 3) \
+                if len(vals) > 0 else np.nan
+            rec[f"{model}_mase_q25"]    = round(
+                vals.quantile(.25), 3) if len(vals) > 0 else np.nan
+            rec[f"{model}_mase_q75"]    = round(
+                vals.quantile(.75), 3) if len(vals) > 0 else np.nan
+            rec[f"{model}_mase_max"]    = round(
+                vals.max(), 3) if len(vals) > 0 else np.nan
+            rec[f"{model}_spike_rate"]  = round(
+                (vals > SPIKE_THRESHOLD).mean(), 3) \
+                if len(vals) > 0 else np.nan
+            rec[f"{model}_smape_median"] = round(
+                w[smape_col].dropna().median(), 2) \
+                if smape_col in w.columns else np.nan
+
+        if red_col in w.columns:
+            rec[f"{model}_unf_reduction"] = round(
+                w[red_col].dropna().median(), 2)
+
+    # Who wins per SKU?
+    sarima_m  = rec.get("sarima_mase_median", np.nan)
+    chronos_m = rec.get("chronos_mase_median", np.nan)
+    timesfm_m = rec.get("timesfm_mase_median", np.nan)
+
+    best_mase = min(
+        [(sarima_m,  "sarima"),
+         (chronos_m, "chronos"),
+         (timesfm_m, "timesfm")],
+        key=lambda x: x[0] if not np.isnan(x[0]) else np.inf
+    )
+    rec["best_model"] = best_mase[1]
+
+    # Is TSFM clearly better than SARIMA on this SKU?
+    if not np.isnan(sarima_m) and not np.isnan(chronos_m):
+        improvement = (sarima_m - chronos_m) / sarima_m
+        rec["chronos_beats_sarima"] = improvement > 0
+        rec["chronos_improvement_pct"] = round(
+            improvement * 100, 1)
+    else:
+        rec["chronos_beats_sarima"]     = np.nan
+        rec["chronos_improvement_pct"]  = np.nan
+
+    sku_summary.append(rec)
+
+df_sku = pd.DataFrame(sku_summary)
+
+# ══════════════════════════════════════════════════════════════
+# STEP 9 — PORTFOLIO AND CLASS-LEVEL RESULTS
+# ══════════════════════════════════════════════════════════════
+
+print("\n" + "=" * 65)
+print("STEP 9 — Results")
+print("=" * 65)
+
+models = ["ya", "sarima", "chronos", "timesfm"]
+model_labels = {
+    "ya":      "Yearly Avg (baseline)",
+    "sarima":  "SARIMA",
+    "chronos": "Chronos 2",
+    "timesfm": "TimesFM",
+}
+
+print("\n  PORTFOLIO-LEVEL RESULTS (MASE vs Yearly Average):")
+print(f"  {'Model':<25} {'Median MASE':<14} "
+      f"{'IQR':<22} {'Spike rate':<12} {'Median sMAPE'}")
+print("  " + "-" * 85)
+for model in models:
+    col = f"{model}_mase_median"
+    if col not in df_sku.columns:
+        continue
+    vals  = df_sku[col].dropna()
+    spike = df_sku.get(f"{model}_spike_rate",
+                       pd.Series([np.nan])).dropna()
+    sm    = df_sku.get(f"{model}_smape_median",
+                       pd.Series([np.nan])).dropna()
+    if len(vals) == 0:
+        continue
+    print(f"  {model_labels[model]:<25} "
+          f"{vals.median():<14.3f} "
+          f"[{vals.quantile(.25):.3f}, "
+          f"{vals.quantile(.75):.3f}]{'':<6} "
+          f"{spike.mean()*100:<12.1f} "
+          f"{sm.median():.1f}%")
+
+print("\n  RESULTS BY DEMAND CLASS:")
+cls_list = df_sku["demand_class"].unique().tolist()
+for cls in cls_list:
+    sub = df_sku[df_sku["demand_class"] == cls]
+    if len(sub) == 0:
+        continue
+    print(f"\n  {cls.upper()} (n={len(sub)} SKUs):")
+    for model in ["sarima", "chronos", "timesfm"]:
+        col = f"{model}_mase_median"
+        if col in sub.columns:
+            vals = sub[col].dropna()
+            if len(vals) > 0:
+                print(f"    {model_labels[model]:<25} "
+                      f"MASE={vals.median():.3f}  "
+                      f"sMAPE={sub[f'{model}_smape_median'].dropna().median():.1f}%")
+
+print("\n  SKU-LEVEL WIN/LOSS SUMMARY:")
+print(f"  SKUs where Chronos beats SARIMA: "
+      f"{df_sku['chronos_beats_sarima'].sum()}")
+print(f"  SKUs where SARIMA beats Chronos: "
+      f"{(~df_sku['chronos_beats_sarima'].fillna(True)).sum()}")
+
+print("\n  CHRONOS IMPROVEMENT OVER SARIMA BY DEMAND CLASS:")
+for cls in cls_list:
+    sub = df_sku[df_sku["demand_class"] == cls]
+    imp = sub["chronos_improvement_pct"].dropna()
+    if len(imp) > 0:
+        print(f"  {cls:15s}: median improvement = "
+              f"{imp.median():.1f}%  "
+              f"(+ve = Chronos better)")
+
+print("\n  SIMULATED UNFULFILLED ORDER REDUCTION vs Yearly Average:")
+for model in ["sarima", "chronos", "timesfm"]:
+    col = f"{model}_unf_reduction"
+    if col in df_sku.columns:
+        vals = df_sku[col].dropna()
+        if len(vals) > 0:
+            print(f"  {model_labels[model]:<25}: "
+                  f"median={vals.median():.1f}%  "
+                  f"(+ve = fewer unfulfilled orders)")
+
+print("\n  CHRONOS PREDICTION INTERVAL COVERAGE:")
+cov = df_results["chronos_coverage"].dropna()
+if len(cov) > 0:
+    print(f"  Median coverage: {cov.median():.3f} "
+          f"(target = 0.80 for 80% PI)")
+    print(f"  Well-calibrated = coverage close to 0.80")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 10 — FEASIBILITY DECISION
+# ══════════════════════════════════════════════════════════════
+
+print("\n" + "=" * 65)
+print("STEP 10 — Feasibility Decision")
+print("=" * 65)
+
+# Compute overall TSFM improvement over SARIMA
+sarima_overall  = df_sku["sarima_mase_median"].dropna().median()
+chronos_overall = df_sku["chronos_mase_median"].dropna().median()
+timesfm_overall = df_sku["timesfm_mase_median"].dropna().median()
+
+chronos_improvement = ((sarima_overall - chronos_overall)
+                       / sarima_overall * 100
+                       if sarima_overall > 0 else 0)
+timesfm_improvement = ((sarima_overall - timesfm_overall)
+                       / sarima_overall * 100
+                       if sarima_overall > 0 else 0)
+
+# Improvement on erratic SKUs specifically
+erratic_skus    = df_sku[df_sku["demand_class"] == "erratic"]
+sarima_erratic  = erratic_skus["sarima_mase_median"].dropna().median()
+chronos_erratic = erratic_skus["chronos_mase_median"].dropna().median()
+erratic_improvement = ((sarima_erratic - chronos_erratic)
+                       / sarima_erratic * 100
+                       if not np.isnan(sarima_erratic)
+                       and sarima_erratic > 0 else 0)
+
+print(f"\n  SARIMA overall median MASE:   {sarima_overall:.3f}")
+print(f"  Chronos overall median MASE:  {chronos_overall:.3f}")
+print(f"  TimesFM overall median MASE:  {timesfm_overall:.3f}")
+print(f"\n  Chronos improvement over SARIMA: "
+      f"{chronos_improvement:.1f}%")
+print(f"  TimesFM improvement over SARIMA: "
+      f"{timesfm_improvement:.1f}%")
+print(f"\n  Chronos improvement on erratic SKUs: "
+      f"{erratic_improvement:.1f}%")
+print(f"\n  Decision thresholds:")
+print(f"  Overall improvement needed:  > {THRESHOLD_OVERALL*100:.0f}%")
+print(f"  Erratic improvement needed:  > {THRESHOLD_ERRATIC*100:.0f}%")
+
+# Decision
+clear_overall  = chronos_improvement > THRESHOLD_OVERALL * 100
+clear_erratic  = erratic_improvement > THRESHOLD_ERRATIC * 100
+
+print(f"\n  {'='*50}")
+if clear_overall:
+    decision = "PASS 1 POSITIVE — TSFMs clearly outperform SARIMA"
+    next_step = "Feasibility confirmed. Proceed to XAI analysis."
+elif clear_erratic:
+    decision = ("PASS 1 PARTIAL — TSFMs outperform on erratic SKUs "
+                "but not overall")
+    next_step = ("Partial feasibility. Proceed to Pass 2 to check "
+                 "if overall improvement can be achieved.")
+else:
+    decision = ("PASS 1 INCONCLUSIVE — TSFMs do not clearly "
+                "outperform SARIMA")
+    next_step = ("Proceed to Pass 2 — optimisation attempts "
+                 "to improve TSFM performance.")
+
+print(f"\n  DECISION: {decision}")
+print(f"  NEXT:     {next_step}")
+print(f"  {'='*50}")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 11 — PLOTS
+# ══════════════════════════════════════════════════════════════
+
+print("\n" + "=" * 65)
+print("STEP 11 — Generating Plots")
+print("=" * 65)
+
+# Plot 1 — MASE comparison all models
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# Portfolio-level boxplot
+ax = axes[0]
+plot_models = [m for m in models
+               if f"{m}_mase_median" in df_sku.columns]
+bp_data = [df_sku[f"{m}_mase_median"].dropna().values
+           for m in plot_models]
+bp = ax.boxplot(bp_data,
+                labels=[model_labels[m] for m in plot_models],
+                patch_artist=True)
+model_colors = ["#95a5a6", "#3498db", "#e74c3c", "#9b59b6"]
+for patch, c in zip(bp["boxes"], model_colors[:len(plot_models)]):
+    patch.set_facecolor(c)
+    patch.set_alpha(0.7)
+ax.axhline(1.0, color="black", linestyle="--",
+           alpha=0.6, label="MASE=1 (=Yearly Avg baseline)")
+ax.set_title("MASE vs Yearly Average Baseline\nAll SKUs",
+             fontsize=11)
+ax.set_ylabel("Median MASE (lower = better)", fontsize=10)
+ax.tick_params(axis="x", rotation=15)
+ax.legend(fontsize=8)
+
+# By demand class
+ax = axes[1]
+x      = np.arange(len(cls_list))
+width  = 0.25
+colors = ["#3498db", "#e74c3c", "#9b59b6"]
+for j, (model, color) in enumerate(
+    zip(["sarima", "chronos", "timesfm"], colors)
+):
+    col  = f"{model}_mase_median"
+    vals = [df_sku.loc[df_sku["demand_class"] == cls,
+                        col].dropna().median()
+            if col in df_sku.columns else np.nan
+            for cls in cls_list]
+    ax.bar(x + j * width, vals, width,
+           label=model_labels[model],
+           color=color, alpha=0.8)
+ax.axhline(1.0, color="black", linestyle="--",
+           alpha=0.5, linewidth=1)
+ax.set_xticks(x + width)
+ax.set_xticklabels(cls_list, rotation=15, fontsize=9)
+ax.set_title("MASE by Demand Class", fontsize=11)
+ax.set_ylabel("Median MASE", fontsize=10)
+ax.legend(fontsize=8)
+
+plt.suptitle("Pass 1 — Zero-Shot TSFM vs SARIMA Benchmark",
+             fontsize=13, fontweight="bold")
+plt.tight_layout()
+plt.savefig(f"{OUTPUT_DIR}/plots/P1_01_mase_comparison.png",
+            dpi=150, bbox_inches="tight")
+plt.close()
+print("  Saved: P1_01_mase_comparison.png")
+
+# Plot 2 — Win/loss per SKU
+fig, ax = plt.subplots(figsize=(12, max(4, len(feasible_skus) * 0.35)))
+sku_labels = []
+for _, row in df_sku.iterrows():
+    imp = row.get("chronos_improvement_pct", 0)
+    color = "#2ecc71" if imp > 0 else "#e74c3c"
+    ax.barh(len(sku_labels), imp if not np.isnan(imp) else 0,
+            color=color, alpha=0.8)
+    sku_labels.append(
+        f"{row['sku_id']} ({row['demand_class'][0].upper()}) "
+        f"CR={row['censoring_ratio']:.2f}"
+    )
+ax.set_yticks(range(len(sku_labels)))
+ax.set_yticklabels(sku_labels, fontsize=7)
+ax.axvline(0, color="black", linewidth=1)
+ax.axvline(THRESHOLD_OVERALL * 100, color="orange",
+           linestyle="--", alpha=0.7,
+           label=f"Overall threshold ({THRESHOLD_OVERALL*100:.0f}%)")
+ax.set_xlabel("Chronos 2 improvement over SARIMA (%)\n"
+              "(positive = Chronos better)", fontsize=10)
+ax.set_title("Pass 1 — Per-SKU: Does Chronos Beat SARIMA?\n"
+             "(Green = Chronos wins, Red = SARIMA wins)",
+             fontsize=11)
+ax.legend(fontsize=8)
+plt.tight_layout()
+plt.savefig(f"{OUTPUT_DIR}/plots/P1_02_per_sku_winloss.png",
+            dpi=150, bbox_inches="tight")
+plt.close()
+print("  Saved: P1_02_per_sku_winloss.png")
+
+# Plot 3 — Simulated unfulfilled order reduction
+fig, ax = plt.subplots(figsize=(10, 5))
+x      = np.arange(len(feasible_skus))
+width  = 0.3
+colors = ["#3498db", "#e74c3c", "#9b59b6"]
+for j, (model, color) in enumerate(
+    zip(["sarima", "chronos", "timesfm"], colors)
+):
+    col  = f"{model}_unf_reduction"
+    vals = [df_sku.loc[df_sku["sku_id"] == sku, col].values[0]
+            if col in df_sku.columns else np.nan
+            for sku in feasible_skus]
+    ax.bar(x + j * width, vals, width,
+           label=model_labels[model],
+           color=color, alpha=0.8)
+ax.axhline(0, color="black", linewidth=1)
+ax.set_xticks(x + width)
+ax.set_xticklabels(
+    [f"{sku}\n({df_meta.loc[df_meta['sku_id']==sku,'demand_class'].values[0][0].upper()})"
+     for sku in feasible_skus],
+    rotation=90, fontsize=6
+)
+ax.set_ylabel("Simulated unfulfilled order reduction (%)\n"
+              "vs Yearly Average baseline", fontsize=9)
+ax.set_title("Pass 1 — Simulated Unfulfilled Order Reduction\n"
+             "(positive = fewer unfulfilled orders vs yearly avg)",
+             fontsize=11)
+ax.legend(fontsize=8)
+plt.tight_layout()
+plt.savefig(
+    f"{OUTPUT_DIR}/plots/P1_03_unfulfilled_reduction.png",
+    dpi=150, bbox_inches="tight")
+plt.close()
+print("  Saved: P1_03_unfulfilled_reduction.png")
+
+# Plot 4 — Chronos prediction interval coverage
+if "chronos_coverage" in df_results.columns:
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    cov_by_class = [
+        df_results.loc[
+            df_results["demand_class"] == cls,
+            "chronos_coverage"
+        ].dropna().values
+        for cls in cls_list
+    ]
+    bp = axes[0].boxplot(cov_by_class, labels=cls_list,
+                         patch_artist=True)
+    for patch, cls in zip(bp["boxes"], cls_list):
+        patch.set_facecolor(COLORS.get(cls, "grey"))
+        patch.set_alpha(0.7)
+    axes[0].axhline(0.80, color="red", linestyle="--",
+                    label="Target coverage (0.80)")
+    axes[0].set_title("Chronos 80% PI Coverage by Demand Class",
+                      fontsize=11)
+    axes[0].set_ylabel("Coverage (ideal = 0.80)", fontsize=10)
+    axes[0].legend(fontsize=8)
+
+    cens_cov  = df_results.loc[
+        df_results["is_censored"], "chronos_coverage"].dropna()
+    clean_cov = df_results.loc[
+        ~df_results["is_censored"], "chronos_coverage"].dropna()
+    axes[1].boxplot(
+        [clean_cov, cens_cov],
+        labels=["Clean windows", "Censored windows"],
+        patch_artist=True
+    )
+    axes[1].axhline(0.80, color="red", linestyle="--",
+                    label="Target (0.80)")
+    axes[1].set_title("Coverage: Censored vs Clean Windows",
+                      fontsize=11)
+    axes[1].legend(fontsize=8)
+    plt.suptitle("Chronos 2 — Probabilistic Forecast Quality",
+                 fontsize=12)
+    plt.tight_layout()
+    plt.savefig(
+        f"{OUTPUT_DIR}/plots/P1_04_coverage.png",
+        dpi=150, bbox_inches="tight")
+    plt.close()
+    print("  Saved: P1_04_coverage.png")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 12 — SAVE ALL OUTPUTS
+# ══════════════════════════════════════════════════════════════
+
+print("\n" + "=" * 65)
+print("STEP 12 — Saving Outputs")
+print("=" * 65)
+
+# Window-level results (without large list columns)
+save_cols = [c for c in df_results.columns
+             if not c.endswith("_pred")]
+df_results[save_cols].to_csv(
+    f"{OUTPUT_DIR}/pass1_window_results.csv", index=False)
+print("  Saved: pass1_window_results.csv")
+
+df_sku.to_csv(
+    f"{OUTPUT_DIR}/pass1_sku_summary.csv", index=False)
+print("  Saved: pass1_sku_summary.csv")
+
+df_meta.to_csv(
+    f"{OUTPUT_DIR}/pass1_sku_metadata.csv", index=False)
+print("  Saved: pass1_sku_metadata.csv")
+
+# Save decision summary as JSON
+decision_summary = {
+    "pass":                    1,
+    "aggregation":             AGG_LEVEL,
+    "horizon_months":          HORIZON,
+    "min_train_months":        MIN_TRAIN,
+    "n_windows":               N_WINDOWS,
+    "n_feasible_skus":         len(feasible_skus),
+    "demand_classes_found":    df_meta["demand_class"]\
+                               .value_counts().to_dict(),
+    "sarima_median_mase":      round(float(sarima_overall), 3),
+    "chronos_median_mase":     round(float(chronos_overall), 3),
+    "timesfm_median_mase":     round(float(timesfm_overall), 3),
+    "chronos_improvement_pct": round(float(chronos_improvement), 1),
+    "erratic_improvement_pct": round(float(erratic_improvement), 1),
+    "clear_overall_win":       bool(clear_overall),
+    "clear_erratic_win":       bool(clear_erratic),
+    "decision":                decision,
+    "next_step":               next_step,
+}
+
+with open(f"{OUTPUT_DIR}/pass1_decision.json", "w") as f:
+    json.dump(decision_summary, f, indent=2)
+print("  Saved: pass1_decision.json")
+
+print(f"""
+{'='*65}
+PASS 1 COMPLETE
+{'='*65}
+
+{decision}
+
+Key results:
+  SARIMA  median MASE: {sarima_overall:.3f}
+  Chronos median MASE: {chronos_overall:.3f}
+  TimesFM median MASE: {timesfm_overall:.3f}
+
+  Chronos improvement overall:       {chronos_improvement:.1f}%
+  Chronos improvement on erratic:    {erratic_improvement:.1f}%
+
+Next step: {next_step}
+
+Outputs in {OUTPUT_DIR}/:
+  pass1_window_results.csv   — per-window metrics
+  pass1_sku_summary.csv      — per-SKU summary
+  pass1_sku_metadata.csv     — demand classes, censoring ratios
+  pass1_decision.json        — machine-readable decision
+
+  plots/
+    P1_01_mase_comparison.png      — model comparison
+    P1_02_per_sku_winloss.png      — SKU-level wins/losses
+    P1_03_unfulfilled_reduction.png — business impact
+    P1_04_coverage.png             — Chronos uncertainty quality
+""")
